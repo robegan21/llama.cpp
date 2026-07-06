@@ -1670,6 +1670,15 @@ private:
         }
 
         if (ret) {
+            // Verify that the prompt tracking is consistent with the KV cache
+            // This can happen after device loss or other unexpected events
+            const llama_pos kv_pos_max = llama_memory_seq_pos_max(llama_get_memory(ret->ctx_tgt), ret->id);
+            if (kv_pos_max >= 0 && ret->prompt.tokens.size() > 0 && (size_t)kv_pos_max + 1 != ret->prompt.tokens.size()) {
+                SRV_WRN("slot %d: prompt tracking out of sync with KV cache (prompt.size()=%zu, kv_pos_max=%d) - clearing prompt\n",
+                        ret->id, ret->prompt.tokens.size(), kv_pos_max);
+                ret->prompt_clear(false);
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -2733,6 +2742,8 @@ private:
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                // Clear the prompt to ensure stale position tracking doesn't persist
+                slot.prompt_clear(false);
             }
         }
     }
@@ -3115,6 +3126,15 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+
+                        // Verify that the prompt tracking is consistent with the KV cache
+                        // This can happen after device loss or other unexpected events
+                        const llama_pos kv_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                        if (kv_pos_max >= 0 && slot.prompt.tokens.size() > 0 && (size_t)kv_pos_max + 1 != slot.prompt.tokens.size()) {
+                            SLT_WRN(slot, "prompt tracking out of sync with KV cache (prompt.size()=%zu, kv_pos_max=%d) - clearing prompt\n",
+                                    slot.prompt.tokens.size(), kv_pos_max);
+                            slot.prompt_clear(false);
+                        }
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
