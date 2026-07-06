@@ -140,11 +140,12 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
-    // the base cache is a superset of the SWA cache, so we can just check the SWA cache
-    return kv_swa->seq_pos_min(seq_id);
+    // The base cache contains all tokens, so we need to check it for the minimum position
+    return kv_base->seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
+    // The SWA cache contains the most recent tokens, so we check it for the maximum position
     return kv_swa->seq_pos_max(seq_id);
 }
 
