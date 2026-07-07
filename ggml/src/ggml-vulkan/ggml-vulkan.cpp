@@ -2099,6 +2099,7 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+    size_t prealloc_size_x_peak, prealloc_size_y_peak, prealloc_size_split_k_peak, prealloc_size_add_rms_partials_peak;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
@@ -2109,6 +2110,9 @@ struct ggml_backend_vk_context {
     bool do_add_rms_partials;
 
     uint64_t last_total_flops {UINT64_MAX};
+
+    static constexpr float MEMORY_SHRINK_THRESHOLD = 0.75f;
+    static constexpr size_t MEMORY_SHRINK_MIN_REDUCTION = 64 * 1024 * 1024;  // 64MB
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -7089,8 +7093,11 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-    // Fixed size of 1KB, for deterministic behavior
+    ctx->prealloc_size_x_peak = 0;
+    ctx->prealloc_size_y_peak = 0;
+    ctx->prealloc_size_split_k_peak = 0;
     ctx->prealloc_size_add_rms_partials = 1024;
+    ctx->prealloc_size_add_rms_partials_peak = 0;
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
@@ -14447,17 +14454,38 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->compute_ctx = subctx;
     }
 
-    if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {
+    vk::PhysicalDeviceMemoryProperties mem_props = ctx->device->physical_device.getMemoryProperties();
+    vk::DeviceSize device_memory_total = 0;
+    for (uint32_t i = 0; i < mem_props.memoryHeapCount; ++i) {
+        if (mem_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            device_memory_total = mem_props.memoryHeaps[i].size;
+            break;
+        }
+    }
+    
+    size_t current_prealloc_total = 0;
+    if (ctx->prealloc_x) current_prealloc_total += ctx->prealloc_x->size;
+    if (ctx->prealloc_y) current_prealloc_total += ctx->prealloc_y->size;
+    if (ctx->prealloc_split_k) current_prealloc_total += ctx->prealloc_split_k->size;
+    if (ctx->prealloc_add_rms_partials) current_prealloc_total += ctx->prealloc_add_rms_partials->size;
+    
+    float memory_pressure = device_memory_total > 0 ? current_prealloc_total / (float)device_memory_total : 0.0f;
+    
+    static constexpr float MEMORY_SHRINK_THRESHOLD = 0.75f;
+    
+    bool shrink_all = memory_pressure > MEMORY_SHRINK_THRESHOLD;
+    
+    if ((shrink_all || ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) && ctx->prealloc_size_x > 0) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(x_size: " << ctx->prealloc_size_x << ")");
-        // Resize buffer
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
+        ctx->prealloc_size_x_peak = std::max(ctx->prealloc_size_x_peak, ctx->prealloc_size_x);
     }
-    if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
+    
+    if ((shrink_all || ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) && ctx->prealloc_size_y > 0) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
-        // Resize buffer
         if (ctx->prealloc_y != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_y);
         }
@@ -14465,22 +14493,25 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->prealloc_y_last_pipeline_used = nullptr;
         ctx->prealloc_y_last_tensor_used = nullptr;
         ctx->prealloc_y_last_decode_vector_staging = false;
+        ctx->prealloc_size_y_peak = std::max(ctx->prealloc_size_y_peak, ctx->prealloc_size_y);
     }
-    if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
+    
+    if ((shrink_all || ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) && ctx->prealloc_size_split_k > 0) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
-        // Resize buffer
         if (ctx->prealloc_split_k != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
+        ctx->prealloc_size_split_k_peak = std::max(ctx->prealloc_size_split_k_peak, ctx->prealloc_size_split_k);
     }
-    if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
-        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
-        // Resize buffer
+    
+    if ((shrink_all || ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) && ctx->prealloc_size_add_rms_partials > 0) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_size_add_rms_partials << ")");
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_size_add_rms_partials_peak = std::max(ctx->prealloc_size_add_rms_partials_peak, ctx->prealloc_size_add_rms_partials);
     }
 }
 
@@ -15115,6 +15146,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_x_peak = 0;
+    ctx->prealloc_size_y_peak = 0;
+    ctx->prealloc_size_split_k_peak = 0;
+    ctx->prealloc_size_add_rms_partials_peak = 0;
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -15669,11 +15704,31 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             };
             si.setPNext(&tl_info);
             std::lock_guard<std::mutex> guard(queue_mutex);
-            ctx->device->compute_queue.queue.submit({ si }, ctx->fence);
+            try {
+                ctx->device->compute_queue.queue.submit({ si }, ctx->fence);
+            } catch (const vk::DeviceLostError& e) {
+                GGML_LOG_ERROR("Vulkan device lost (ErrorDeviceLost) - memory pressure may be too high\n");
+                ctx->submit_pending = false;
+                if (cmd_buf) {
+                    cmd_buf->in_use = false;
+                    cmd_buf->buf.reset();
+                }
+                return;
+            }
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
         } else {
             std::lock_guard<std::mutex> guard(queue_mutex);
-            ctx->device->compute_queue.queue.submit({}, ctx->fence);
+            try {
+                ctx->device->compute_queue.queue.submit({}, ctx->fence);
+            } catch (const vk::DeviceLostError& e) {
+                GGML_LOG_ERROR("Vulkan device lost (ErrorDeviceLost) - memory pressure may be too high\n");
+                ctx->submit_pending = false;
+                if (cmd_buf) {
+                    cmd_buf->in_use = false;
+                    cmd_buf->buf.reset();
+                }
+                return;
+            }
         }
         ggml_vk_wait_for_fence(ctx);
         ctx->submit_pending = false;
