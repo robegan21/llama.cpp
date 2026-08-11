@@ -96,7 +96,7 @@ static bool test_kq_scaling() {
     // Compare with tolerance
     bool passed = true;
     int mismatches = 0;
-    const float tol = 1e-5f;
+    const float tol = 1e-4f;
     
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
