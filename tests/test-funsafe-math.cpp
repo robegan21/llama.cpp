@@ -9,7 +9,7 @@
 
 #define EPSILON 1e-6
 
-bool test_softmax_stability() {
+static bool test_softmax_stability() {
     printf("Testing softmax stability...\n");
     
     const int n = 1000;
@@ -52,7 +52,7 @@ bool test_softmax_stability() {
     return true;
 }
 
-bool test_kq_scaling() {
+static bool test_kq_scaling() {
     printf("Testing KQ scaling...\n");
     
     const int N = 32;
@@ -60,7 +60,6 @@ bool test_kq_scaling() {
     
     float * q = (float *)malloc(N * D * sizeof(float));
     float * k = (float *)malloc(N * D * sizeof(float));
-    float * qk_ref = (float *)malloc(N * N * sizeof(float));
     
     srand(42);
     for (int i = 0; i < N * D; i++) {
@@ -68,34 +67,44 @@ bool test_kq_scaling() {
         k[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
     }
     
-    // Compute Q * K^T reference (row-major)
     const float scale = 1.0f / sqrtf((float)D);
+    
+    // Compute Q * K^T (the actual operation being tested)
+    float * qk = (float *)malloc(N * N * sizeof(float));
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             float dot = 0.0f;
             for (int d = 0; d < D; d++) {
                 dot += q[i * D + d] * k[j * D + d];
             }
-            qk_ref[i * N + j] = dot * scale;
+            qk[i * N + j] = dot * scale;
         }
     }
     
-    // Verify the reference computation
-    bool passed = true;
-    int mismatches = 0;
-    
-    // Re-compute and compare
+    // Compute reference using double precision for accuracy
+    float * qk_ref = (float *)malloc(N * N * sizeof(float));
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
-            float dot = 0.0f;
+            double dot = 0.0;
             for (int d = 0; d < D; d++) {
-                dot += q[i * D + d] * k[j * D + d];
+                dot += (double)q[i * D + d] * (double)k[j * D + d];
             }
-            float scaled = dot * scale;
-            
-            if (fabsf(scaled - qk_ref[i * N + j]) > EPSILON) {
+            qk_ref[i * N + j] = (float)(dot * scale);
+        }
+    }
+    
+    // Compare with tolerance
+    bool passed = true;
+    int mismatches = 0;
+    const float tol = 1e-5f;
+    
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            float diff = fabsf(qk[i * N + j] - qk_ref[i * N + j]);
+            float scale_val = fabsf(qk_ref[i * N + j]) + tol;
+            if (diff > tol * scale_val) {
                 if (mismatches < 5) {
-                    printf("Mismatch at %d: got %f, expected %f\n", i * N + j, scaled, qk_ref[i * N + j]);
+                    printf("Mismatch at %d: got %f, expected %f, diff=%e\n", i * N + j, qk[i * N + j], qk_ref[i * N + j], diff);
                 }
                 mismatches++;
                 passed = false;
@@ -105,6 +114,7 @@ bool test_kq_scaling() {
     
     free(q);
     free(k);
+    free(qk);
     free(qk_ref);
     
     if (!passed) {
@@ -116,7 +126,7 @@ bool test_kq_scaling() {
     return true;
 }
 
-bool test_attention_value_range() {
+static bool test_attention_value_range() {
     printf("Testing attention value range...\n");
     
     const int N = 64;
